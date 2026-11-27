@@ -145,6 +145,78 @@ def _require_sm89():
         pytest.skip("RTC MegaMoE requires a SM89 PPU")
 
 
+@pytest.mark.parametrize("compute,layout", [("bf16", "split"), ("bf16", "g8"), ("fp8", "split")])
+def test_deepgemm_training(compute, layout):
+    """Optional backend: all gradients, strided lists, masked slots and live updates."""
+    _require_sm89()
+    training = pytest.importorskip("deep_gemm.training")
+    ids = torch.tensor([[1, 1, -1], [2, -1, 1], [-1, -1, -1], [0, 2, 0]], dtype=torch.int32)
+    x, probs, w1, w2, dy = _inputs(ids, torch.bfloat16, 4, hidden=512, intermediate=256)
+    local_x, local_p = _device(x, grad=True), _device(probs, grad=True)
+    local_w1 = [_device(w, grad=True) for w in w1]
+    local_w2 = [_device(w, grad=True) for w in w2]
+    options = dict(
+        chunk_tokens=128,
+        compute=compute,
+        gate_up_layout=layout,
+        check_errors=True,
+        device=local_x.device,
+        fuse_dispatch=compute == "bf16",
+    )
+    plan = training.MegaMoEPlan(512, 256, 4, 3, len(ids), **options)
+    native_plan = (
+        training.MegaMoEPlan(512, 256, 4, 3, len(ids), **options) if compute == "fp8" else None
+    )
+    params = (local_x, local_p, *local_w1, *local_w2)
+    for step in range(2):
+        if step:
+            # The lists are independent parameter allocations, not views into
+            # the backend's previous stack. Never cache stale packed weights.
+            with torch.no_grad():
+                local_w1[0].add_(0.01)
+                w1[0].add_(0.01)
+        expected_y, expected_grads = _reference(ids, x, probs, w1, w2, dy)
+        if native_plan is not None:
+            # FP8 is an explicit backend precision policy. Check that adapting
+            # parameter lists preserves its native output and every gradient;
+            # quantization error against BF16 is a separate numerical contract.
+            expected_y = training.mega_moe(
+                local_x.contiguous(),
+                _device(ids).contiguous(),
+                local_p.contiguous(),
+                torch.stack(local_w1),
+                torch.stack(local_w2),
+                plan=native_plan,
+            )
+            expected_grads = torch.autograd.grad(expected_y, params, _device(dy))
+        output = te.deepgemm_mega_moe(local_x, _device(ids), local_p, local_w1, local_w2, plan=plan)
+        actual = (output, *torch.autograd.grad(output, params, _device(dy)))
+        for value, ref in zip(actual, (expected_y, *expected_grads), strict=True):
+            assert value.dtype == ref.dtype and value.shape == ref.shape
+            assert torch.isfinite(value).all()
+            if native_plan is not None:
+                torch.testing.assert_close(value, ref, rtol=0, atol=0)
+                continue
+            value, ref = value.cpu().float(), ref.float()
+            drift = (value - ref).norm() / ref.norm().clamp_min(1e-12)
+            assert drift < 0.012, (compute, layout, step, drift)
+        assert torch.count_nonzero(actual[2][ids.to(local_p.device) == -1]) == 0
+        assert torch.count_nonzero(actual[2 + len(local_w1)]) == 0  # Unused FC1 expert 3.
+    # Reject unsupported G8 dimensions before launching a packing kernel.
+    with pytest.raises(ValueError, match="match the DeepGEMM plan"):
+        te.deepgemm_mega_moe(
+            local_x,
+            _device(ids),
+            local_p,
+            [w[:38] for w in local_w1],
+            [w[:, :19] for w in local_w2],
+            plan=plan,
+        )
+    plan.check_errors = False
+    with pytest.raises(ValueError, match="check_errors=True"):
+        te.deepgemm_mega_moe(local_x, _device(ids), local_p, local_w1, local_w2, plan=plan)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("scenario", ["mixed", "multiple_tiles", "all_dropped", "no_tokens"])
 def test_rtc_training(dtype, scenario):

@@ -468,3 +468,80 @@ I=3072 and eight source tags. To add a model case, place its `.tags` under
 call key and a unique model/call label to `qa/L0_pytorch_mega_moe_rtc/cases.txt`. Numerical failures
 block the job. Manual and perf/refactor runs also enforce a 5% total latency
 regression threshold.
+
+## 13. Optional DeepGEMM training backend
+
+`te.deepgemm_mega_moe(x, ids, probabilities, fc1_weights, fc2_weights, plan=plan)`
+accepts the same separate BF16 parameter lists as the RTC entry. The caller supplies
+a `deep_gemm.training.MegaMoEPlan`, which owns the process group, capacity and compute
+policy. The direct peer group can span multiple hosts within one PPU0015 supernode.
+This is an explicit alternative; `bf16_mega_moe` and its EP8 saved-activation path
+keep their existing behavior.
+
+Install a matching PPU DeepGEMM build with training support. The evaluated dependency
+is [DeepGEMM-for-sail training PR #244](https://github.com/t-head/DeepGEMM-for-sail/pull/244),
+commit `ee49f047fd1fe23ee79a4add7c743fb5e3b5f7f7`, on SDK 2.2.0 / Torch 2.11. This is an
+optional, unmerged feature dependency, not a requirement for importing TE or using
+RTC. G8 weight packing uses the SDK's PPU Triton. No DeepGEMM kernels are copied into TE.
+
+DeepGEMM applies probabilities after FC2. RTC applies them to SwiGLU before FC2.
+The real-valued formulas agree, but the intermediate rounding differs. Inputs and
+parameters remain BF16 with either BF16 or FP8 compute, and parameter gradients
+return in BF16 after F32 accumulation. FP8 is an explicit precision tradeoff.
+Parameter stacks are rebuilt each call, including the inverse G8 permutation in
+backward; optimizer updates remain visible. These copies and gradient casts are
+included in the benchmark. Each plan stays on one stream; overlapping calls need
+separate plans. Eager calls require `check_errors=True`. After CUDA graph replay,
+call `plan.check()` outside capture. Only first-order autograd is supported, and
+this entry does not support torch.compile.
+
+The existing training benchmark can compare this entry with public RTC on the same
+inputs without requiring DeepEP. Select `--reference saved` to assert the EP8 saved
+path; use `--reference rtc` for larger groups. Its default DeepEP comparison remains
+unchanged. A JSON file supplies kernel `environment` and constructor `plan` options.
+Collective transports use the launcher's `PCCL_*` / `NCCL_*` environment; those keys
+are ignored in the kernel JSON and the effective values are printed. Restore
+the complete matching DeepGEMM recipe, including the DW LUT, rather than mixing knobs
+from different models. For example, generate an EP32 Qwen3.5-397B-A17B BF16 config:
+
+```bash
+export DEEPGEMM_ROOT=/path/to/DeepGEMM-for-sail
+python - <<'PY'
+import json, os, runpy
+from pathlib import Path
+root = Path(os.environ['DEEPGEMM_ROOT']).resolve()
+m = runpy.run_path(str(root / 'tests/benchmark_mega_moe_training.py'))
+book = m['load_recipes']()
+r = m['select_recipe'](book, 32, 'Qwen3.5-397B-A17B', 'bf16')
+a = m['recipe_arguments'](r)
+names = ('chunk_tokens', 'compute', 'block_m', 'gate_up_layout', 'ring_rows',
+         'wgrad_overlap', 'overlap_expert_dy', 'dispatch_producer', 'expert_local_grad',
+         'fuse_activation_backward', 'fuse_dhidden_scores', 'fuse_fc1_activation',
+         'input_copy_ilp', 'producer_input_aiu', 'producer_local_aiu',
+         'reuse_packed_dy', 'transpose_free_dgrad')
+plan = {name: getattr(a, name) for name in names if getattr(a, name) is not None}
+plan.update(check_errors=True, fast_weight_transpose=True,
+            fuse_dispatch=not a.no_fuse_dispatch)
+if a.gemm_config:
+    plan['gemm_configs'] = {role: a.gemm_config for role in ('fc1', 'fc2', 'dhidden', 'dx')}
+Path('deepgemm-plan.json').write_text(json.dumps({
+    'environment': m['configure'](r, book), 'plan': plan}, indent=2))
+PY
+# Run on each of four idle hosts in the same supernode, with NODE_RANK=0..3.
+export PCCL_MNNVL_ENABLE=1 NCCL_MNNVL_ENABLE=1
+torchrun --nnodes=4 --nproc-per-node=8 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
+  benchmarks/gemm/benchmark_mega_moe_ep8_training.py \
+  --deepgemm-config deepgemm-plan.json --reference rtc \
+  --hidden 4096 --intermediate 1024 --tokens 4096 --local-experts 16 --topk 10 \
+  --warmup 5 --iters 20 --repeats 5 --seeds 1073 1077
+```
+
+`MEDIAN` reports forward, backward and whole-step milliseconds as the median of
+repeat medians; each iteration takes the maximum rank for each interval. The whole
+step includes routed expert forward/backward and excludes the router projection,
+shared experts, attention and optimizer. Before timing, every output and gradient
+must pass the reported relative-L2 threshold (BF16 default 0.012). An FP8 recipe can
+use an explicitly reported `--relative-l2-tolerance 0.08`; a BF16/FP8 timing ratio
+must be labeled as a precision comparison. These are single-layer measurements,
+not end-to-end model-training speedups.

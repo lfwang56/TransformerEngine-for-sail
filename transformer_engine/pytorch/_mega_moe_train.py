@@ -13,6 +13,64 @@ from ._mega_moe_train_route import prepare, return_grad, stage_source
 
 
 @triton.jit
+def _g8_weight_copy(
+    source,
+    output,
+    TOTAL: tl.constexpr,
+    H: tl.constexpr,
+    I: tl.constexpr,
+    INVERSE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    lane = tl.arange(0, BLOCK)
+    for first in range(tl.program_id(0).to(tl.int64) * BLOCK, TOTAL, tl.num_programs(0) * BLOCK):
+        offset = first + lane
+        row = (offset // H % (2 * I)).to(tl.int32)
+        if INVERSE:
+            mapped = (row % I // 8) * 16 + row // I * 8 + row % 8
+        else:
+            mapped = row // 16 * 8 + row % 16 // 8 * I + row % 8
+        index = (offset // (2 * I * H) * (2 * I) + mapped) * H + offset % H
+        value = tl.load(source + index, offset < TOTAL, 0)
+        tl.store(output + offset, value, offset < TOTAL)
+
+
+def _copy_g8_weight(weight, inverse=False):
+    """Coalesced row permutation for a contiguous [E,2I,H] expert stack."""
+    weight = weight.contiguous()
+    output = torch.empty_like(weight)
+    if weight.numel():
+        total, hidden = weight.numel(), weight.shape[-1]
+        blocks = torch.cuda.get_device_properties(weight.device).multi_processor_count * 16
+        with torch.cuda.device(weight.device):
+            _g8_weight_copy[(min(blocks, triton.cdiv(total, 1024)),)](
+                weight,
+                output,
+                total,
+                hidden,
+                weight.shape[-2] // 2,
+                inverse,
+                1024,
+                num_warps=4,
+            )
+    return output
+
+
+class _PackG8Weight(torch.autograd.Function):
+    """Keep the original independent expert parameters as autograd leaves."""
+
+    @staticmethod
+    def forward(_ctx, weight):
+        """Pack gate/up rows without detaching the caller's parameters."""
+        return _copy_g8_weight(weight)
+
+    @staticmethod
+    def backward(_ctx, gradient):
+        """Return the parameter gradient in its original split layout."""
+        return _copy_g8_weight(gradient, inverse=True)
+
+
+@triton.jit
 def _activation(z, prob, raw, y, I: tl.constexpr, B: tl.constexpr):
     r = tl.program_id(0)
     j = tl.program_id(1) * B + tl.arange(0, B)

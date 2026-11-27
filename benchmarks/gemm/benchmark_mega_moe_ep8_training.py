@@ -12,6 +12,7 @@ import json
 import argparse
 import os
 import statistics
+from pathlib import Path
 
 from benchmark_mega_moe_ep8 import Baseline, routes
 from benchmark_mega_moe_deepep import DeepEPLegacyForward, profile_kernels
@@ -25,7 +26,6 @@ from transformer_engine.pytorch.cpp_extensions.gemm import general_grouped_gemm
 from transformer_engine.pytorch.module.base import _2X_ACC_DGRAD, _2X_ACC_WGRAD
 from transformer_engine.pytorch._mega_moe_train import _activation_grad, _save_activation
 from transformer_engine.pytorch.mega_moe import _bf16_forward
-from deep_ep import topk_idx_t
 
 
 @triton.jit
@@ -76,6 +76,8 @@ class DeepTraining(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, ids, probs, base, *weights):
+        from deep_ep import topk_idx_t
+
         e, k = base.experts, ids.size(1)
         w1, w2 = weights[:e], weights[e:]
         idx = ids.to(topk_idx_t)
@@ -193,6 +195,8 @@ class DeepExpandedTraining(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x, ids, probs, base, *weights):
+        from deep_ep import topk_idx_t
+
         e = base.experts
         w1, w2 = weights[:e], weights[e:]
         owner_x, _, p, handle, _ = base.buffer.dispatch(
@@ -283,6 +287,29 @@ def main():
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=8)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--hidden", type=int, default=3584)
+    parser.add_argument("--intermediate", type=int, default=3072)
+    parser.add_argument("--tokens", type=int, default=2048)
+    parser.add_argument("--local-experts", type=int, default=8)
+    parser.add_argument("--topk", type=int, default=8)
+    parser.add_argument(
+        "--deepgemm-config",
+        type=Path,
+        help="Compare RTC with DeepGEMM using JSON environment/plan options",
+    )
+    parser.add_argument(
+        "--reference",
+        choices=("saved", "rtc"),
+        default="saved",
+        help="Require EP8 saved activations, or use the public RTC entry",
+    )
+    parser.add_argument(
+        "--relative-l2-tolerance",
+        type=float,
+        default=0.012,
+        help="Report and enforce this output/gradient bound; FP8 is a precision tradeoff",
+    )
     parser.add_argument(
         "--seeds",
         type=int,
@@ -291,23 +318,37 @@ def main():
         help="Cycle these balanced routes between rounds",
     )
     args = parser.parse_args()
-    if args.warmup < 0 or args.iters < 1:
+    if args.warmup < 0 or args.iters < 1 or args.repeats < 1:
         parser.error("expected nonnegative warmup and positive iteration count")
+    if not 0 < args.relative_l2_tolerance <= 0.1:
+        parser.error("relative L2 tolerance must be in (0,0.1]")
+    config = json.loads(args.deepgemm_config.read_text()) if args.deepgemm_config else None
+    if config:
+        # The launcher controls collectives for both arms. A kernel recipe must
+        # not disable RTC's fabric transport before process-group creation.
+        os.environ.update(
+            {
+                k: str(v)
+                for k, v in config.get("environment", {}).items()
+                if not k.startswith(("PCCL_", "NCCL_"))
+            }
+        )
     rank = int(os.environ["LOCAL_RANK"])
     dev = torch.device("cuda", rank)
     torch.cuda.set_device(dev)
     dist.init_process_group("nccl", device_id=dev)
     group = dist.group.WORLD
-    assert group.size() == 8, "expected eight ranks"
+    if config is None:
+        assert group.size() == 8 and args.topk == 8, "DeepEP comparison expects EP8/top-k8"
     torch.manual_seed(1500 + rank)
-    h, i, t = 3584, 3072, 2048
+    h, i, t, e = args.hidden, args.intermediate, args.tokens, args.local_experts
     w1 = [
-        (torch.randn(2 * i, h, device=dev) / h**0.5).bfloat16().requires_grad_() for _ in range(8)
+        (torch.randn(2 * i, h, device=dev) / h**0.5).bfloat16().requires_grad_() for _ in range(e)
     ]
-    w2 = [(torch.randn(h, i, device=dev) / i**0.5).bfloat16().requires_grad_() for _ in range(8)]
+    w2 = [(torch.randn(h, i, device=dev) / i**0.5).bfloat16().requires_grad_() for _ in range(e)]
     x = torch.randn(t, h, device=dev).bfloat16().requires_grad_()
     dy = torch.randn_like(x)
-    batches = [routes(t, 64, 8, seed, rank, dev) for seed in args.seeds]
+    batches = [routes(t, group.size() * e, args.topk, seed, rank, dev) for seed in args.seeds]
     for _, p in batches:
         p.requires_grad_()
     ids, p = batches[0]
@@ -315,15 +356,52 @@ def main():
 
     def saved():
         out = te.bf16_mega_moe(x, ids, p, w1, w2, ep_group=group)
-        assert "TrainBackward" in type(out.grad_fn).__name__
+        if args.reference == "saved":
+            assert "TrainBackward" in type(out.grad_fn).__name__
         return out
 
-    base = Baseline(group, t, h, 8, None, w1, w2, 39)
-    methods = {
-        "saved": saved,
-        "deepep": lambda: DeepTraining.apply(x, ids, p, base, *w1, *w2),
-        "deepep_expanded": lambda: DeepExpandedTraining.apply(x, ids, p, base, *w1, *w2),
-    }
+    base = None
+    if config is None:
+        base = Baseline(group, t, h, e, None, w1, w2, 39)
+        methods = {
+            "saved": saved,
+            "deepep": lambda: DeepTraining.apply(x, ids, p, base, *w1, *w2),
+            "deepep_expanded": lambda: DeepExpandedTraining.apply(x, ids, p, base, *w1, *w2),
+        }
+    else:
+        from deep_gemm.training import MegaMoEPlan, to_g8_weight
+
+        plan = MegaMoEPlan(h, i, e, args.topk, t, group=group, device=dev, **config["plan"])
+        with torch.no_grad():
+            first = torch.stack(w1)
+            if plan.gate_up_layout == "g8":
+                first = to_g8_weight(first)
+            plan.prepare(first, torch.stack(w2))
+        methods = {
+            args.reference: saved,
+            "deepgemm_" + plan.compute: lambda: te.deepgemm_mega_moe(x, ids, p, w1, w2, plan=plan),
+        }
+        if not rank:
+            print(
+                "CONFIG",
+                json.dumps(
+                    dict(
+                        ep=group.size(),
+                        hidden=h,
+                        intermediate=i,
+                        tokens=t,
+                        local_experts=e,
+                        topk=args.topk,
+                        config=config,
+                        collective_environment={
+                            k: v for k, v in os.environ.items() if k.startswith(("PCCL_", "NCCL_"))
+                        },
+                        relative_l2_tolerance=args.relative_l2_tolerance,
+                        scope="eager public autograd, all weight packing and parameter-gradient casts included",
+                    )
+                ),
+                flush=True,
+            )
     if args.include_recompute:
         methods["recompute"] = lambda: _bf16_forward(x, ids, p, w1, w2, group.group_name)
     # Cross-check every implementation before accepting its samples.
@@ -351,16 +429,18 @@ def main():
             dist.all_reduce(drift, dist.ReduceOp.MAX)
             if not rank:
                 print("REL_L2", name, drift.tolist(), flush=True)
-            assert drift.max().item() < 0.012
+            assert torch.isfinite(drift).all() and drift.max().item() < args.relative_l2_tolerance
     del ref, tensors
     if args.profile:
-        out = methods["saved"]()
+        out = methods[next(iter(methods))]()
         kernels, _ = profile_kernels(lambda: torch.autograd.grad(out, params, dy))
         if not rank:
             print("BWD_KERNELS", json.dumps(dict(kernels)), flush=True)
     data = {name: [] for name in methods}
+    repeated = []
     a, b, c = [torch.cuda.Event(enable_timing=True) for _ in range(3)]
-    for round_idx in range(args.warmup + args.iters):
+    for round_idx in range(args.repeats * (args.warmup + args.iters)):
+        step = round_idx % (args.warmup + args.iters)
         ids, p = batches[round_idx % len(batches)]
         params = (x, p, *w1, *w2)
         order = list(methods)
@@ -379,19 +459,33 @@ def main():
             )
             dist.all_reduce(elapsed, dist.ReduceOp.MAX)
             sample = elapsed.tolist()
-            if round_idx >= args.warmup:
+            if step >= args.warmup:
                 data[name].append(sample)
             del grad, out
         if not rank:
             print("ROUND", round_idx, flush=True)
+        if step == args.warmup + args.iters - 1:
+            medians = {
+                name: list(map(statistics.median, zip(*values[-args.iters :])))
+                for name, values in data.items()
+            }
+            repeated.append(medians)
+            if not rank:
+                print("REPEAT_MEDIAN", json.dumps(medians), flush=True)
     if not rank:
         print(
             "MEDIAN",
-            json.dumps({k: list(map(statistics.median, zip(*v))) for k, v in data.items()}),
+            json.dumps(
+                {
+                    name: [statistics.median(run[name][j] for run in repeated) for j in range(3)]
+                    for name in methods
+                }
+            ),
             flush=True,
         )
         print("SAMPLES", json.dumps(data), flush=True)
-    base.buffer.destroy()
+    if base is not None:
+        base.buffer.destroy()
     dist.destroy_process_group()
 
 

@@ -151,9 +151,7 @@ def _mega_moe(x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group
     )
 
 
-def _run_mega_moe(
-    x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
-):
+def _validate_inputs(x, expert_ids, routing_weights, fc1_weights, fc2_weights, dtype):
     if x.ndim != 2 or x.dtype != dtype:
         raise ValueError(f"x must have dtype {dtype} and shape [T,H]")
     if expert_ids.dtype != torch.int32 or routing_weights.dtype != torch.float32:
@@ -178,6 +176,12 @@ def _run_mega_moe(
             raise ValueError("FC1 and FC2 weights must have shapes [2I,H] and [H,I]")
         if any(w.dtype != dtype or w.device != x.device for w in (w1, w2)):
             raise ValueError("expert weights must have the same dtype and device as x")
+
+
+def _run_mega_moe(
+    x, expert_ids, routing_weights, fc1_weights, fc2_weights, ep_group, dtype, forward
+):
+    _validate_inputs(x, expert_ids, routing_weights, fc1_weights, fc2_weights, dtype)
     if (
         not torch.compiler.is_compiling()
         and not is_fake(x)
@@ -216,6 +220,76 @@ def _run_mega_moe(
         list(fc2_weights),
         "" if ep_group is None else ep_group.group_name,
     )
+
+
+def deepgemm_mega_moe(
+    x: Tensor,
+    expert_ids: Tensor,
+    routing_weights: Tensor,
+    fc1_weights: Sequence[Tensor],
+    fc2_weights: Sequence[Tensor],
+    *,
+    plan,
+) -> Tensor:
+    """Apply routed SwiGLU using an explicitly supplied PPU DeepGEMM training plan.
+
+    Requires the optional ``t-head/DeepGEMM-for-sail`` training implementation
+    and a ``deep_gemm.training.MegaMoEPlan``. The plan owns the expert-parallel
+    process group, token capacity, bounded workspace and BF16/FP8 compute policy.
+    Its group must fit one direct peer domain; on PPU0015 this can span multiple
+    hosts in one physical supernode. It must use ``check_errors=True``.
+
+    Inputs, global expert IDs and separate local expert weight lists follow
+    :func:`bf16_mega_moe`; x and weights are BF16 even for FP8 compute. Parameters
+    are packed on every call, so optimizer updates remain visible. Autograd
+    returns BF16 input/parameter gradients and FP32 routing-weight gradients.
+    FP8 compute is an explicit precision choice, not a BF16-equivalent backend.
+
+    DeepGEMM weights the FC2 result rather than the SwiGLU input to FC2. These
+    formulas are equivalent in real arithmetic but have different intermediate
+    rounding; this opt-in entry does not promise bitwise agreement with RTC.
+    The default RTC entry points and their EP8 fast path are unchanged.
+
+    Warm up the plan before CUDA graph capture and check ``plan.check()`` after
+    replay. Keep each plan on one stream and use separate plans for overlapping
+    calls. Only first-order autograd is supported; torch.compile is unsupported.
+    See ``benchmarks/gemm/README.md`` for dependency and measurement details.
+    """
+    _validate_inputs(x, expert_ids, routing_weights, fc1_weights, fc2_weights, torch.bfloat16)
+    if torch.compiler.is_compiling() or is_fake(x) or not x.is_cuda:
+        raise NotImplementedError(
+            "DeepGEMM MegaMoE requires real PPU tensors outside torch.compile"
+        )
+    # Keep DeepGEMM optional: importing TE or using RTC must not load its extension.
+    try:
+        from deep_gemm.training import MegaMoEPlan, mega_moe
+    except ImportError as error:
+        raise ImportError(
+            "deepgemm_mega_moe requires PPU DeepGEMM with training support; "
+            "see benchmarks/gemm/README.md"
+        ) from error
+    if not isinstance(plan, MegaMoEPlan):
+        raise TypeError("plan must be a deep_gemm.training.MegaMoEPlan")
+    if not plan.check_errors:
+        raise ValueError("DeepGEMM MegaMoE requires a plan with check_errors=True")
+    actual = (x.device, x.size(1), expert_ids.size(1), len(fc1_weights), fc2_weights[0].size(1))
+    expected = (plan.device, plan.h, plan.k, plan.e, plan.i)
+    if actual != expected or x.size(0) > plan.max_tokens:
+        raise ValueError("inputs and expert weights must match the DeepGEMM plan")
+    with torch.cuda.device(x.device):
+        first = torch.stack(tuple(fc1_weights))
+        if plan.gate_up_layout == "g8":
+            from ._mega_moe_train import _PackG8Weight
+
+            first = _PackG8Weight.apply(first)
+        return mega_moe(
+            x.contiguous(),
+            expert_ids.contiguous(),
+            routing_weights.contiguous(),
+            first,
+            torch.stack(tuple(fc2_weights)),
+            plan=plan,
+        )
 
 
 def bf16_mega_moe(
